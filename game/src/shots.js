@@ -1,79 +1,136 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// Solmar Heat — the screenshot scenes behind ?shot=cover|drive|mission|chase.
+// Each one plays the real rules forward from a fresh game for a fixed number
+// of steps, steered by a small autopilot (drive toward a point, walk toward a
+// point), so the frame is what real play looks like and the same seed always
+// gives the same frame. The cover must show at once: the police heli, the
+// wanted stars, the minimap and the mission objective.
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+import { STEP } from './config.js';
+import { SCREEN_PLAY } from './render.js';
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
+// Steering input toward (tx, ty) from wherever the player is right now.
+function driveInput(game, tx, ty) {
+  const s = game.state;
+  const p = s.player;
+  const pv = s.playerVehicle;
+  if (pv) {
+    const want = Math.atan2(ty - pv.y, tx - pv.x);
+    let d = want - pv.angle;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d <= -Math.PI) d += Math.PI * 2;
+    return { up: true, left: d < -0.12, right: d > 0.12 };
   }
-  return Infinity;
+  const dx = tx - p.x;
+  const dy = ty - p.y;
+  return {
+    up: dy < -8, down: dy > 8, left: dx < -8, right: dx > 8,
+    run: Math.hypot(dx, dy) > 120,
+  };
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
+function driveFor(game, tx, ty, seconds) {
+  const steps = Math.floor(seconds / STEP);
+  for (let i = 0; i < steps; i += 1) game.step(STEP, driveInput(game, tx, ty));
 }
 
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+function walkFor(game, tx, ty, seconds) {
+  const steps = Math.floor(seconds / STEP);
+  for (let i = 0; i < steps; i += 1) game.step(STEP, driveInput(game, tx, ty));
+}
+
+function boardOwned(game, type) {
+  game.state.player.rep = 25;
+  game.giveCash(3000);
+  game.buyCar(type);
+  const car = game.state.vehicles[game.state.vehicles.length - 1];
+  game.teleport(car.x, car.y - 30);
+  game.step(STEP, { enter: true });
+  return car;
+}
+
+function stageCover(game) {
+  // Dusk, sports car, wanted 3, mission 1 live, police heli overhead.
+  // Tide first: setTide also resets the clock, so the clock goes last.
+  game.setTide(0.5);
+  game.setClock(18.2);
+  const car = boardOwned(game, 'sports');
+  game.startMission(1);
+  game.setWanted(3);
+  const stand = game.state.places.taxiStand;
+  // Drive toward the fare for 10s: cruisers and the heli close in on the way.
+  driveFor(game, stand.x, stand.y, 10);
+  if (game.state.busted || game.state.wasted) {
+    // The chase caught Rico during staging — put him back in the sports car
+    // with the heat back on so the cover still shows the chase.
+    game.respawn();
+    game.teleport(car.x, car.y - 30);
+    game.step(STEP, { enter: true });
+    game.setWanted(3);
+    game.step(STEP, {});
+    game.step(STEP, {});
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+  if (game.state.playerVehicle) {
+    game.state.playerVehicle.speed = Math.max(game.state.playerVehicle.speed, 120);
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+  return { screen: SCREEN_PLAY };
+}
+
+function stageDrive(game) {
+  // Bright morning, taxi in traffic, clean record.
+  game.setClock(10.0);
+  boardOwned(game, 'taxi');
+  const s = game.state;
+  driveFor(game, s.places.fishMarket.x, s.places.fishMarket.y, 12);
+  if (game.state.playerVehicle) {
+    game.state.playerVehicle.speed = Math.max(game.state.playerVehicle.speed, 150);
+  }
+  return { screen: SCREEN_PLAY };
+}
+
+function stageMission(game) {
+  // Afternoon at the fish market: the heist is live, crates on the ground.
+  game.setClock(15.5);
+  game.startMission(6);
+  const m = game.state.places.fishMarket;
+  game.teleport(m.x - 120, m.y - 60);
+  walkFor(game, m.x, m.y, 3.5);
+  return { screen: SCREEN_PLAY };
+}
+
+function stageChase(game) {
+  // Night, five stars, cruisers on the tail and the heli above.
+  game.setClock(22.0);
+  const car = boardOwned(game, 'sports');
+  game.setWanted(5);
+  const s = game.state;
+  driveFor(game, s.places.oldTown.x, s.places.oldTown.y, 12);
+  if (game.state.busted || game.state.wasted) {
+    // The chase caught Rico during staging — put him back in the sports car
+    // with the heat back on for a short burst so the frame shows the chase.
+    game.respawn();
+    game.teleport(car.x, car.y - 30);
+    game.step(STEP, { enter: true });
+    game.setWanted(5);
+    driveFor(game, s.places.oldTown.x, s.places.oldTown.y, 3);
+  }
+  if (game.state.busted || game.state.wasted) {
+    // Last resort: the car, parked with five stars and the heli overhead.
+    game.respawn();
+    game.teleport(car.x, car.y - 30);
+    game.step(STEP, { enter: true });
+    game.setWanted(5);
+    game.step(STEP, {});
+    game.step(STEP, {});
+  }
+  if (game.state.playerVehicle) {
+    game.state.playerVehicle.speed = Math.max(game.state.playerVehicle.speed, 120);
+  }
+  return { screen: SCREEN_PLAY };
+}
+
+export function stageShot(name, game) {
+  if (name === 'drive') return stageDrive(game);
+  if (name === 'mission') return stageMission(game);
+  if (name === 'chase') return stageChase(game);
+  return stageCover(game);
 }

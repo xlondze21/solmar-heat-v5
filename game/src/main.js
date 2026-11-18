@@ -1,14 +1,24 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
+// Solmar Heat — boot and the one loop. Input is read every frame, the game
+// advances in fixed 1/60 s steps (several in a slow frame, none in a fast
+// one), and the renderer paints what is there. Screens: title, play, paused,
+// busted, wasted.
 //
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
+// ?seed=N fixes the world. ?shot=cover|drive|mission|chase (with &seed=N)
+// stages that scene instead of running the loop, paints it twice and sets
+// window.__shotReady for a screenshot.
+
+import { SAVE_KEY, STEP } from './config.js';
 import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+import { createGame } from './game.js';
+import {
+  ACTION_ENTER, ACTION_PAUSE, ACTION_PUNCH, ACTION_RADIO, ACTION_SHOOT,
+  ACTION_START, createInput,
+} from './input.js';
+import { createAudio } from './audio.js';
+import {
+  createRenderer, SCREEN_BUSTED, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE,
+  SCREEN_WASTED,
+} from './render.js';
 import { stageShot } from './shots.js';
 
 /** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
@@ -21,30 +31,32 @@ const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() 
 
 const canvas = document.getElementById('game');
 const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
+const game = createGame(seed);
 const renderer = createRenderer(canvas);
+const audio = createAudio();
 
-function readBest() {
+function loadSave() {
   try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
+    const raw = window.localStorage.getItem(SAVE_KEY);
+    if (raw) game.loadData(JSON.parse(raw));
   } catch {
-    return 0;
+    // Storage can be off (private windows): the save then lasts this visit only.
   }
 }
 
-function saveBest(value) {
+function persist() {
   try {
-    window.localStorage.setItem(BEST_KEY, String(value));
+    window.localStorage.setItem(SAVE_KEY, JSON.stringify(game.saveData()));
   } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
+    // Ignore: see loadSave.
   }
 }
 
 function runShot(name) {
-  const scene = stageShot(name, world);
+  const scene = stageShot(name, game);
   let painted = 0;
   function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
+    renderer.draw(game.state, scene.screen);
     painted += 1;
     if (painted < 2) requestAnimationFrame(paint);
     else window.__shotReady = true;
@@ -53,72 +65,133 @@ function runShot(name) {
 }
 
 function runGame() {
-  const input = createInput(canvas);
+  const input = createInput();
   let screen = SCREEN_TITLE;
-  let best = readBest();
   let accumulator = 0;
   let last = performance.now();
+  let sirenTimer = 0;
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
   function announce(message) {
     status.textContent = message;
   }
 
   function startGame() {
-    world.reset();
-    accumulator = 0;
+    loadSave();
+    game.state.screen = 'play';
     screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
+    audio.unlock();
+    audio.startRadio();
+    announce('Playing Solmar Heat. WASD to move, E to enter a car.');
   }
 
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
-    }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
-  }
-
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-  }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
+  function handleActions(actions) {
+    if (actions & ACTION_PAUSE) {
+      if (screen === SCREEN_PLAY) {
+        screen = SCREEN_PAUSED;
+        announce('Paused.');
+      } else if (screen === SCREEN_PAUSED) {
+        screen = SCREEN_PLAY;
+        announce('Playing.');
+      }
       return;
     }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
+    if (screen === SCREEN_TITLE && (actions & (ACTION_ENTER | ACTION_START))) {
+      startGame();
+      return;
+    }
+    if ((screen === SCREEN_BUSTED || screen === SCREEN_WASTED) && (actions & ACTION_ENTER)) {
+      game.respawn();
+      screen = SCREEN_PLAY;
+      announce('Back on the streets.');
+    }
+  }
+
+  function stepGame(actions) {
+    const held = input.held;
+    const stepInput = {
+      up: held.up, down: held.down, left: held.left, right: held.right,
+      run: held.run, ascend: held.ascend, descend: held.descend,
+      enter: !!(actions & ACTION_ENTER),
+      punch: !!(actions & ACTION_PUNCH),
+      shoot: !!(actions & ACTION_SHOOT),
+      radio: !!(actions & ACTION_RADIO),
+    };
+    // Mission key: start the next mission from anywhere.
+    if (actions & ACTION_START && !game.state.mission && game.state.nextMission <= 10) {
+      game.startMission(game.state.nextMission);
+    }
+    // Garage keys: buy a car while standing at the garage.
+    const p = game.state.player;
+    const g = game.state.places.garage;
+    const nearGarage = (p.x - g.x) ** 2 + (p.y - g.y) ** 2 < 90 * 90;
+    game.step(STEP, stepInput);
+    // Number-key purchases (read straight from the keyboard each frame).
+    if (nearGarage && !game.state.playerVehicle) {
+      if (window.__buyKey) {
+        const key = window.__buyKey;
+        window.__buyKey = null;
+        if (key === '1') game.buyCar('taxi');
+        else if (key === '2') game.buyCar('truck');
+        else if (key === '3') game.buyCar('sports');
+      }
+    }
+    // Sound + save reactions to what just happened.
+    for (const e of game.drainEvents()) {
+      if (e.type === 'shoot') audio.shot();
+      else if (e.type === 'punch') audio.punch();
+      else if (e.type === 'missionComplete') { audio.jingle(); persist(); }
+      else if (e.type === 'missionFail') audio.fail();
+      else if (e.type === 'safehouse') persist();
+      else if (e.type === 'busted' || e.type === 'wasted') { audio.fail(); persist(); }
+      else if (e.type === 'ram' || e.type === 'carWrecked') audio.crash();
+      else if (e.type === 'heliDown') game.state.stats.heliDown += 1;
+    }
+    if (game.state.player.wanted > 0) {
+      sirenTimer -= STEP;
+      if (sirenTimer <= 0) { audio.siren(); sirenTimer = 2.2; }
+    }
+    const pv = game.state.playerVehicle;
+    audio.setEngine(pv ? Math.abs(pv.speed || 0) : 0, 560);
+    audio.setStation(game.state.radio);
+    if (game.state.busted) {
+      screen = SCREEN_BUSTED;
+      announce(`Busted. The police took their cut.`);
+    } else if (game.state.wasted) {
+      screen = SCREEN_WASTED;
+      announce('Wasted. The hospital patched you up.');
+    }
   }
 
   function frame(now) {
     requestAnimationFrame(frame);
     accumulator += Math.min((now - last) / 1000, MAX_FRAME);
     last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
+    const actions = input.takeActions();
+    handleActions(actions);
+    if (screen === SCREEN_PLAY) {
+      // Edge actions (enter / punch / shoot / radio) fire once: only the
+      // first fixed sub-step of this frame sees them.
+      let first = true;
+      while (accumulator >= STEP) {
+        stepGame(first ? actions : 0);
+        first = false;
         accumulator -= STEP;
+        if (screen !== SCREEN_PLAY) { accumulator = 0; break; }
       }
     } else {
       accumulator = 0;
     }
-    renderer.draw(world.state, screen, best);
+    renderer.draw(game.state, screen);
   }
 
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
+  // Number keys for the garage (kept outside createInput's held set).
+  window.addEventListener('keydown', (event) => {
+    if (event.code === 'Digit1' || event.code === 'Digit2' || event.code === 'Digit3') {
+      window.__buyKey = event.code.slice(-1);
+    }
+  });
+
+  // Leaving the tab pauses a running game rather than letting the heat build unseen.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden && screen === SCREEN_PLAY) {
       screen = SCREEN_PAUSED;
@@ -126,7 +199,7 @@ function runGame() {
     }
   });
 
-  announce('Block Dodger. Press Space or click to start.');
+  announce('Solmar Heat. Press Enter to start.');
   requestAnimationFrame(frame);
 }
 
